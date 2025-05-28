@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DB Stress Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 20px; background-color: #f4f7f9; color: #333; }
+        #root { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #2c3e50; border-bottom: 1px solid #ecf0f1; padding-bottom: 10px; }
+        .stats { margin-bottom: 20px; padding: 10px; border: 1px solid #e0e0e0; border-radius: 4px; background-color: #f9f9f9;}
+        .stats div { margin-bottom: 8px; font-size: 0.95em; }
+        .stats div strong { color: #555; }
+        button { 
+            margin-right: 10px; 
+            padding: 10px 15px; 
+            font-size: 1em; 
+            color: white; 
+            background-color: #3498db; 
+            border: none; 
+            border-radius: 4px; 
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        button:hover { background-color: #2980b9; }
+        button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
+        .error { color: #e74c3c; font-weight: bold; }
+        .log-area {
+            width: 100%;
+            box-sizing: border-box;
+            height: 200px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            overflow-y: auto;
+            margin-top: 10px;
+            padding: 10px;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 0.9em;
+            background-color: #ecf0f1;
+            white-space: pre-wrap;
+            line-height: 1.4;
+        }
+        .log-area div:first-child { font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Global WebsimSocket instance
+        const room = new WebsimSocket();
+        // Use a versioned collection name. Increment if schema changes or to reset test data scope.
+        const COLLECTION_NAME = 'stress_test_rows_v3'; 
+
+        const App = () => {
+            const [isTesting, setIsTesting] = React.useState(false);
+            const [attemptedAdds, setAttemptedAdds] = React.useState(0);
+            const [successfulAdds, setSuccessfulAdds] = React.useState(0);
+            const [errorCount, setErrorCount] = React.useState(0);
+            const [currentDelay, setCurrentDelay] = React.useState(10); // Initial delay in ms
+            const [lastSuccessfulValue, setLastSuccessfulValue] = React.useState(0);
+            const [lastError, setLastError] = React.useState('');
+            const [logMessages, setLogMessages] = React.useState([]);
+
+            const [dbRecordCount, setDbRecordCount] = React.useState(0);
+            const [verificationStatus, setVerificationStatus] = React.useState('');
+            const [minDbValue, setMinDbValue] = React.useState(null);
+            const [maxDbValue, setMaxDbValue] = React.useState(null);
+            const [missingCount, setMissingCount] = React.useState(0);
+            const [uniqueUsernamesInTest, setUniqueUsernamesInTest] = React.useState(0);
+
+
+            const testStateRef = React.useRef({
+                running: false,
+                currentValueToAdd: 0, 
+                delay: 10, // Initial delay, sync with state
+                consecutiveSuccesses: 0,
+                timeoutId: null, 
+            });
+
+            const addLog = React.useCallback((message) => {
+                const timestamp = new Date().toLocaleTimeString();
+                setLogMessages(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)]); // Keep last 200 messages
+            }, []);
+
+            const runTestIteration = React.useCallback(async () => {
+                if (!testStateRef.current.running) return;
+
+                const valueToTry = testStateRef.current.currentValueToAdd + 1;
+                setAttemptedAdds(prev => prev + 1);
+
+                try {
+                    await room.collection(COLLECTION_NAME).create({ 
+                        value: valueToTry, 
+                        timestamp: Date.now() 
+                    });
+                    
+                    setSuccessfulAdds(prev => prev + 1);
+                    setLastSuccessfulValue(valueToTry); // Update state for UI and for restarting
+                    testStateRef.current.currentValueToAdd = valueToTry; // Update ref for next iteration
+                    testStateRef.current.consecutiveSuccesses++;
+
+                    // Adaptive speed adjustment: if many successes, try to speed up
+                    if (testStateRef.current.consecutiveSuccesses >= 30) { // Threshold for speeding up (e.g. 30 successes)
+                        const oldDelay = testStateRef.current.delay;
+                        testStateRef.current.delay = Math.max(1, Math.floor(oldDelay * 0.9)); // Speed up by 10%
+                        if (oldDelay !== testStateRef.current.delay) { 
+                           addLog(`Reduced delay to ${testStateRef.current.delay}ms after ${testStateRef.current.consecutiveSuccesses} successes.`);
+                        }
+                        setCurrentDelay(testStateRef.current.delay);
+                        testStateRef.current.consecutiveSuccesses = 0; 
+                    }
+                } catch (error) {
+                    console.error("Error adding row:", error);
+                    setErrorCount(prev => prev + 1);
+                    setLastError(error.message);
+                    addLog(`Error adding value ${valueToTry}: ${error.message}.`);
+                    
+                    const oldDelay = testStateRef.current.delay;
+                    // Slow down: increase delay by 50% + a small amount proportional to current delay, capped at 10s
+                    testStateRef.current.delay = Math.min(10000, Math.floor(oldDelay * 1.5 + Math.max(20, oldDelay * 0.1))); 
+                    if (oldDelay === testStateRef.current.delay && testStateRef.current.delay < 10000) { // ensure delay increases if it's small
+                        testStateRef.current.delay += 1;
+                    }
+
+                    setCurrentDelay(testStateRef.current.delay);
+                    addLog(`Increased delay to ${testStateRef.current.delay}ms due to error (was ${oldDelay}ms).`);
+                    testStateRef.current.consecutiveSuccesses = 0;
+                }
+
+                if (testStateRef.current.running) {
+                    testStateRef.current.timeoutId = setTimeout(runTestIteration, testStateRef.current.delay);
+                }
+            }, [addLog]); 
+
+            const handleStartTest = React.useCallback(async () => {
+                addLog("Starting test...");
+                
+                testStateRef.current.currentValueToAdd = lastSuccessfulValue; 
+                addLog(`Test will attempt to add values starting from ${testStateRef.current.currentValueToAdd + 1}.`);
+
+                setIsTesting(true);
+                testStateRef.current.running = true;
+                // testStateRef.current.delay = currentDelay; // Use current delay state or reset? Let's use currentDelay from state.
+                // testStateRef.current.consecutiveSuccesses = 0; // Reset this, important for adaptive logic
+                setLastError('');
+
+                runTestIteration();
+            }, [addLog, runTestIteration, lastSuccessfulValue, currentDelay]);
+
+            const handleStopTest = React.useCallback(() => {
+                addLog("Stopping test...");
+                setIsTesting(false);
+                testStateRef.current.running = false;
+                if (testStateRef.current.timeoutId) {
+                    clearTimeout(testStateRef.current.timeoutId);
+                }
+            }, [addLog]);
+
+            const handleResetStats = React.useCallback(() => {
+                addLog("Resetting session stats and logs.");
+                setAttemptedAdds(0);
+                setSuccessfulAdds(0);
+                setErrorCount(0);
+                // setCurrentDelay(10); // Reset delay to initial? Or keep current? Keep for now.
+                // setLastSuccessfulValue(0); // This would restart numbering from 1. User may not want this if they just reset stats.
+                                            // Let's keep lastSuccessfulValue, so numbering continues.
+                setLastError('');
+                setLogMessages([]);
+                testStateRef.current.consecutiveSuccesses = 0;
+            }, [addLog]);
+
+            const handleVerify = React.useCallback(async () => {
+                setVerificationStatus('Verifying...');
+                addLog("Verification started...");
+                try {
+                    await new Promise(resolve => setTimeout(resolve, 500)); 
+
+                    const records = room.collection(COLLECTION_NAME).getList();
+                    setDbRecordCount(records.length);
+                    addLog(`Verification: Found ${records.length} records in collection '${COLLECTION_NAME}'.`);
+
+                    const usernames = new Set();
+                    records.forEach(r => usernames.add(r.username));
+                    setUniqueUsernamesInTest(usernames.size);
+
+                    if (records.length > 0) {
+                        const values = records.map(r => r.value).filter(v => typeof v === 'number').sort((a, b) => a - b);
+                        
+                        if (values.length === 0) {
+                             setMinDbValue(null);
+                             setMaxDbValue(null);
+                             setMissingCount(0);
+                             setVerificationStatus(`Verified. ${records.length} records found, but no numeric 'value' field detected for sequence check.`);
+                             addLog(`Verification: ${records.length} records, but no numeric 'value' field for sequence check.`);
+                             return;
+                        }
+
+                        const minVal = values[0];
+                        const maxVal = values[values.length - 1];
+                        setMinDbValue(minVal);
+                        setMaxDbValue(maxVal);
+                        addLog(`Verification: Min value=${minVal}, Max value=${maxVal} (among ${values.length} numeric values).`);
+
+                        let missing = 0;
+                        const expectedCountInSequence = maxVal - minVal + 1;
+                        
+                        if (values.length < expectedCountInSequence) { // Only check if there's a possibility of missing values
+                            const valueSet = new Set(values); // Set of actual unique values found
+                            for (let i = minVal; i <= maxVal; i++) {
+                                if (!valueSet.has(i)) {
+                                    missing++;
+                                }
+                            }
+                        }
+                        setMissingCount(missing);
+                        addLog(`Verification: Found ${missing} missing values in the sequence from ${minVal} to ${maxVal}.`);
+                        setVerificationStatus(`Verified. ${records.length} records. Values: [${minVal}-${maxVal}]. Missing in seq: ${missing}. Users: ${usernames.size}.`);
+
+                    } else {
+                        setMinDbValue(null);
+                        setMaxDbValue(null);
+                        setMissingCount(0);
+                        setUniqueUsernamesInTest(0);
+                        setVerificationStatus('Verified. 0 records found.');
+                        addLog('Verification: 0 records found.');
+                    }
+                } catch (error) {
+                    console.error("Error verifying records:", error);
+                    setVerificationStatus(`Error during verification: ${error.message}`);
+                    addLog(`Error during verification: ${error.message}`);
+                }
+            }, [addLog]);
+
+            React.useEffect(() => {
+                return () => {
+                    if (testStateRef.current.running) {
+                        handleStopTest(); 
+                    }
+                };
+            }, [handleStopTest]);
+
+            return (
+                <div>
+                    <h1>Database Stress Test</h1>
+                    <div className="stats">
+                        <div>
+                            <button onClick={handleStartTest} disabled={isTesting}>Start Test</button>
+                            <button onClick={handleStopTest} disabled={!isTesting}>Stop Test</button>
+                            <button onClick={handleResetStats} disabled={isTesting}>Reset Session Stats</button>
+                        </div>
+                        <div><strong>Status:</strong> {isTesting ? 'Testing...' : 'Stopped'}</div>
+                        <div><strong>Attempted Adds:</strong> {attemptedAdds}</div>
+                        <div><strong>Successful Adds:</strong> {successfulAdds}</div>
+                        <div><strong>Last Successful Value Added:</strong> {lastSuccessfulValue}</div>
+                        <div><strong>Errors:</strong> {errorCount}</div>
+                        <div><strong>Current Delay:</strong> {currentDelay}ms</div>
+                        {lastError && <div className="error"><strong>Last Error:</strong> {lastError}</div>}
+                    </div>
+
+                    <h2>Verification</h2>
+                    <div className="stats">
+                        <div><button onClick={handleVerify} disabled={isTesting}>Verify Records in DB</button></div>
+                        <div><strong>Verification Status:</strong> {verificationStatus}</div>
+                        <div><strong>Total Records in DB (<code>{COLLECTION_NAME}</code>):</strong> {dbRecordCount}</div>
+                        {minDbValue !== null && <div><strong>Min Value in DB:</strong> {minDbValue}</div>}
+                        {maxDbValue !== null && <div><strong>Max Value in DB:</strong> {maxDbValue}</div>}
+                        {maxDbValue !== null && <div><strong>Missing values in sequence [{minDbValue}-{maxDbValue}]:</strong> {missingCount}</div>}
+                        {dbRecordCount > 0 && <div><strong>Unique users contributing:</strong> {uniqueUsernamesInTest}</div>}
+                    </div>
+
+                    <h2>Logs</h2>
+                    <div className="log-area">
+                        {logMessages.length === 0 && <div>Logs will appear here...</div>}
+                        {logMessages.map((msg, index) => <div key={index}>{msg}</div>)}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
