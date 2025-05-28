@@ -22,6 +22,7 @@
             border-radius: 4px; 
             cursor: pointer;
             transition: background-color 0.2s ease;
+            margin-bottom: 5px; /* Added for spacing if buttons wrap */
         }
         button:hover { background-color: #2980b9; }
         button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
@@ -42,6 +43,9 @@
             line-height: 1.4;
         }
         .log-area div:first-child { font-weight: bold; }
+        .input-group { margin-top: 10px; margin-bottom: 15px; }
+        .input-group label { margin-right: 5px; font-weight: bold; }
+        .input-group input { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
     </style>
 </head>
 <body>
@@ -53,6 +57,39 @@
         // Use a versioned collection name. Increment if schema changes or to reset test data scope.
         const COLLECTION_NAME = 'stress_test_rows_v3'; 
 
+        // Helper function to get records robustly
+        const getRecordsOnceRobust = (collectionName, timeoutMs = 2500) => {
+            return new Promise((resolve) => {
+                let resolved = false;
+                let unsubscribeFn = () => {};
+
+                const tryResolve = (records) => {
+                    if (!resolved) {
+                        resolved = true;
+                        clearTimeout(timeoutId);
+                        unsubscribeFn(); // Call the stored unsubscribe function
+                        resolve(records);
+                    }
+                };
+
+                // Assign the actual unsubscribe function once subscription starts
+                unsubscribeFn = room.collection(collectionName).subscribe(records => {
+                    if (records.length > 0) {
+                        tryResolve(records);
+                    }
+                    // If records are empty, it might be initial state. We wait for either
+                    // a subsequent non-empty update or the main timeout.
+                });
+
+                const timeoutId = setTimeout(() => {
+                    // If not resolved by now, take the current getList() result.
+                    // This also handles cases where the collection is genuinely empty.
+                    tryResolve(room.collection(collectionName).getList());
+                }, timeoutMs);
+            });
+        };
+
+
         const App = () => {
             const [isTesting, setIsTesting] = React.useState(false);
             const [attemptedAdds, setAttemptedAdds] = React.useState(0);
@@ -62,6 +99,8 @@
             const [lastSuccessfulValue, setLastSuccessfulValue] = React.useState(0);
             const [lastError, setLastError] = React.useState('');
             const [logMessages, setLogMessages] = React.useState([]);
+            const [manualStartInput, setManualStartInput] = React.useState('');
+
 
             const [dbRecordCount, setDbRecordCount] = React.useState(0);
             const [verificationStatus, setVerificationStatus] = React.useState('');
@@ -74,43 +113,39 @@
             const testStateRef = React.useRef({
                 running: false,
                 currentValueToAdd: 0, 
-                delay: 10, // Initial delay, sync with state
+                delay: 10, 
                 consecutiveSuccesses: 0,
                 timeoutId: null, 
             });
 
             const addLog = React.useCallback((message) => {
                 const timestamp = new Date().toLocaleTimeString();
-                setLogMessages(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)]); // Keep last 200 messages
+                setLogMessages(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)]);
             }, []);
 
-            // Effect for initializing from DB on component mount
             React.useEffect(() => {
                 const initializeFromDB = async () => {
                     addLog("Attempting to initialize from existing DB data...");
                     try {
-                        // Short delay to allow getList to potentially populate from cache/network
-                        // This is a pragmatic approach; for more robust loading, a subscription or promise-based getList would be better.
-                        await new Promise(resolve => setTimeout(resolve, 300)); 
-
-                        const records = room.collection(COLLECTION_NAME).getList();
+                        const records = await getRecordsOnceRobust(COLLECTION_NAME);
+                        
                         if (records && records.length > 0) {
                             const values = records
                                 .map(r => r.value)
-                                .filter(v => typeof v === 'number' && !isNaN(v)); // Ensure it's a valid number
+                                .filter(v => typeof v === 'number' && !isNaN(v));
 
                             if (values.length > 0) {
                                 const maxVal = Math.max(...values);
                                 setLastSuccessfulValue(maxVal);
-                                testStateRef.current.currentValueToAdd = maxVal; // Sync ref for next iteration logic
-                                addLog(`Initialized. Max value found in DB: ${maxVal}. Next add will be ${maxVal + 1}.`);
+                                testStateRef.current.currentValueToAdd = maxVal; 
+                                addLog(`Initialized. Max value found in DB: ${maxVal}. Next add will be ${maxVal + 1} (unless overridden by manual start).`);
                             } else {
-                                addLog("Initialized. No numeric 'value' field found in existing records. Starting from 0. Next add will be 1.");
+                                addLog("Initialized. No numeric 'value' field found in existing records. Starting from 0. Next add will be 1 (unless overridden).");
                                 setLastSuccessfulValue(0);
                                 testStateRef.current.currentValueToAdd = 0;
                             }
                         } else {
-                            addLog("Initialized. No existing records found or DB empty. Starting from 0. Next add will be 1.");
+                            addLog("Initialized. No existing records found or DB empty. Starting from 0. Next add will be 1 (unless overridden).");
                             setLastSuccessfulValue(0);
                             testStateRef.current.currentValueToAdd = 0;
                         }
@@ -123,7 +158,6 @@
                 };
 
                 initializeFromDB();
-                // addLog is memoized and stable, so this effect runs once on mount.
             }, [addLog]);
 
 
@@ -140,14 +174,13 @@
                     });
                     
                     setSuccessfulAdds(prev => prev + 1);
-                    setLastSuccessfulValue(valueToTry); // Update state for UI and for restarting
-                    testStateRef.current.currentValueToAdd = valueToTry; // Update ref for next iteration
+                    setLastSuccessfulValue(valueToTry); 
+                    testStateRef.current.currentValueToAdd = valueToTry; 
                     testStateRef.current.consecutiveSuccesses++;
 
-                    // Adaptive speed adjustment: if many successes, try to speed up
-                    if (testStateRef.current.consecutiveSuccesses >= 30) { // Threshold for speeding up (e.g. 30 successes)
+                    if (testStateRef.current.consecutiveSuccesses >= 30) { 
                         const oldDelay = testStateRef.current.delay;
-                        testStateRef.current.delay = Math.max(1, Math.floor(oldDelay * 0.9)); // Speed up by 10%
+                        testStateRef.current.delay = Math.max(1, Math.floor(oldDelay * 0.9)); 
                         if (oldDelay !== testStateRef.current.delay) { 
                            addLog(`Reduced delay to ${testStateRef.current.delay}ms after ${testStateRef.current.consecutiveSuccesses} successes.`);
                         }
@@ -161,9 +194,8 @@
                     addLog(`Error adding value ${valueToTry}: ${error.message}.`);
                     
                     const oldDelay = testStateRef.current.delay;
-                    // Slow down: increase delay by 50% + a small amount proportional to current delay, capped at 10s
                     testStateRef.current.delay = Math.min(10000, Math.floor(oldDelay * 1.5 + Math.max(20, oldDelay * 0.1))); 
-                    if (oldDelay === testStateRef.current.delay && testStateRef.current.delay < 10000) { // ensure delay increases if it's small
+                    if (oldDelay === testStateRef.current.delay && testStateRef.current.delay < 10000) { 
                         testStateRef.current.delay += 1;
                     }
 
@@ -178,20 +210,34 @@
             }, [addLog]); 
 
             const handleStartTest = React.useCallback(async () => {
-                addLog("Starting test...");
+                addLog("Processing start test request...");
                 
-                // Ensure testStateRef.currentValueToAdd is synced with lastSuccessfulValue from state (which might have been DB initialized)
-                testStateRef.current.currentValueToAdd = lastSuccessfulValue; 
-                addLog(`Test will attempt to add values starting from ${testStateRef.current.currentValueToAdd + 1}.`);
+                let effectiveStartValueForLogic = lastSuccessfulValue; // Default to current last successful value
+                const parsedManualInput = parseInt(manualStartInput);
 
+                if (manualStartInput !== '' && !isNaN(parsedManualInput) && parsedManualInput >= 0) { // Allow starting from 0
+                    // User wants to start adding *at* parsedManualInput.
+                    // So, the "previous successful value" for logic is parsedManualInput - 1.
+                    effectiveStartValueForLogic = parsedManualInput - 1;
+                    addLog(`Manual start: Test will attempt to add value ${parsedManualInput}. Internal 'previous value' set to ${effectiveStartValueForLogic}.`);
+                    // Update lastSuccessfulValue state to reflect this manual override for UI consistency.
+                    // This means if user types 1, lastSuccessfulValue becomes 0 before test starts.
+                    setLastSuccessfulValue(effectiveStartValueForLogic); 
+                } else {
+                    addLog(`Starting from last known/detected value. Next attempt will be ${lastSuccessfulValue + 1}.`);
+                }
+                
+                testStateRef.current.currentValueToAdd = effectiveStartValueForLogic; 
+                
                 setIsTesting(true);
                 testStateRef.current.running = true;
-                testStateRef.current.delay = currentDelay; // Use current delay state.
-                testStateRef.current.consecutiveSuccesses = 0; // Reset this, important for adaptive logic
+                testStateRef.current.delay = currentDelay;
+                testStateRef.current.consecutiveSuccesses = 0;
                 setLastError('');
+                addLog(`Test starting. Attempting to add values from ${testStateRef.current.currentValueToAdd + 1} onwards with delay ${currentDelay}ms.`);
 
                 runTestIteration();
-            }, [addLog, runTestIteration, lastSuccessfulValue, currentDelay]);
+            }, [addLog, runTestIteration, lastSuccessfulValue, currentDelay, manualStartInput]);
 
             const handleStopTest = React.useCallback(() => {
                 addLog("Stopping test...");
@@ -207,22 +253,19 @@
                 setAttemptedAdds(0);
                 setSuccessfulAdds(0);
                 setErrorCount(0);
-                // currentDelay and lastSuccessfulValue are intentionally not reset here.
-                // lastSuccessfulValue reflects DB state or progress within current session.
-                // currentDelay might be something user wants to persist for next run within the session.
                 setLastError('');
-                setLogMessages([]); // Clears current session logs. Initialization log will reappear if page reloaded.
+                setLogMessages([]); 
                 testStateRef.current.consecutiveSuccesses = 0;
+                // Do not reset manualStartInput, lastSuccessfulValue, or currentDelay, allow user to reuse.
+                // Re-run initializeFromDB to ensure lastSuccessfulValue is current if DB changed by others.
+                // For simplicity here, we'll let manual input override or user can re-verify.
             }, [addLog]);
 
             const handleVerify = React.useCallback(async () => {
                 setVerificationStatus('Verifying...');
                 addLog("Verification started...");
                 try {
-                    // Short delay for getList, similar to initialization logic.
-                    await new Promise(resolve => setTimeout(resolve, 300)); 
-
-                    const records = room.collection(COLLECTION_NAME).getList();
+                    const records = await getRecordsOnceRobust(COLLECTION_NAME);
                     setDbRecordCount(records.length);
                     addLog(`Verification: Found ${records.length} records in collection '${COLLECTION_NAME}'.`);
 
@@ -251,7 +294,6 @@
                         let missing = 0;
                         const expectedCountInSequence = maxVal - minVal + 1;
                         
-                        // Only check for missing if the number of unique values is less than the range span
                         if (values.length < expectedCountInSequence) { 
                             const valueSet = new Set(values); 
                             for (let i = minVal; i <= maxVal; i++) {
@@ -280,24 +322,35 @@
             }, [addLog]);
 
             React.useEffect(() => {
-                // Cleanup effect to stop test if component unmounts
                 return () => {
                     if (testStateRef.current.running) {
                         handleStopTest(); 
                     }
                 };
-            }, [handleStopTest]); // handleStopTest is memoized
+            }, [handleStopTest]);
 
             return (
                 <div>
                     <h1>Database Stress Test</h1>
                     <div className="stats">
+                        <div className="input-group">
+                            <label htmlFor="manualStartValue">Start Adding Value From: </label>
+                            <input 
+                                type="number" 
+                                id="manualStartValue"
+                                value={manualStartInput} 
+                                onChange={e => setManualStartInput(e.target.value)}
+                                placeholder="e.g., 1 (or leave blank)"
+                                disabled={isTesting}
+                                min="0"
+                            />
+                        </div>
                         <div>
                             <button onClick={handleStartTest} disabled={isTesting}>Start Test</button>
                             <button onClick={handleStopTest} disabled={!isTesting}>Stop Test</button>
                             <button onClick={handleResetStats} disabled={isTesting}>Reset Session Stats</button>
                         </div>
-                        <div><strong>Status:</strong> {isTesting ? 'Testing...' : 'Stopped'}</div>
+                        <div><strong>Status:</strong> {isTesting ? `Testing (next: ${testStateRef.current.currentValueToAdd + 1})...` : 'Stopped'}</div>
                         <div><strong>Attempted Adds:</strong> {attemptedAdds}</div>
                         <div><strong>Successful Adds:</strong> {successfulAdds}</div>
                         <div><strong>Last Successful Value Added:</strong> {lastSuccessfulValue}</div>
