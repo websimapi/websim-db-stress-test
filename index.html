@@ -84,6 +84,49 @@
                 setLogMessages(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)]); // Keep last 200 messages
             }, []);
 
+            // Effect for initializing from DB on component mount
+            React.useEffect(() => {
+                const initializeFromDB = async () => {
+                    addLog("Attempting to initialize from existing DB data...");
+                    try {
+                        // Short delay to allow getList to potentially populate from cache/network
+                        // This is a pragmatic approach; for more robust loading, a subscription or promise-based getList would be better.
+                        await new Promise(resolve => setTimeout(resolve, 300)); 
+
+                        const records = room.collection(COLLECTION_NAME).getList();
+                        if (records && records.length > 0) {
+                            const values = records
+                                .map(r => r.value)
+                                .filter(v => typeof v === 'number' && !isNaN(v)); // Ensure it's a valid number
+
+                            if (values.length > 0) {
+                                const maxVal = Math.max(...values);
+                                setLastSuccessfulValue(maxVal);
+                                testStateRef.current.currentValueToAdd = maxVal; // Sync ref for next iteration logic
+                                addLog(`Initialized. Max value found in DB: ${maxVal}. Next add will be ${maxVal + 1}.`);
+                            } else {
+                                addLog("Initialized. No numeric 'value' field found in existing records. Starting from 0. Next add will be 1.");
+                                setLastSuccessfulValue(0);
+                                testStateRef.current.currentValueToAdd = 0;
+                            }
+                        } else {
+                            addLog("Initialized. No existing records found or DB empty. Starting from 0. Next add will be 1.");
+                            setLastSuccessfulValue(0);
+                            testStateRef.current.currentValueToAdd = 0;
+                        }
+                    } catch (error) {
+                        console.error("Error initializing from DB:", error);
+                        addLog(`Error during DB initialization: ${error.message}. Assuming start from 0.`);
+                        setLastSuccessfulValue(0);
+                        testStateRef.current.currentValueToAdd = 0;
+                    }
+                };
+
+                initializeFromDB();
+                // addLog is memoized and stable, so this effect runs once on mount.
+            }, [addLog]);
+
+
             const runTestIteration = React.useCallback(async () => {
                 if (!testStateRef.current.running) return;
 
@@ -137,13 +180,14 @@
             const handleStartTest = React.useCallback(async () => {
                 addLog("Starting test...");
                 
+                // Ensure testStateRef.currentValueToAdd is synced with lastSuccessfulValue from state (which might have been DB initialized)
                 testStateRef.current.currentValueToAdd = lastSuccessfulValue; 
                 addLog(`Test will attempt to add values starting from ${testStateRef.current.currentValueToAdd + 1}.`);
 
                 setIsTesting(true);
                 testStateRef.current.running = true;
-                // testStateRef.current.delay = currentDelay; // Use current delay state or reset? Let's use currentDelay from state.
-                // testStateRef.current.consecutiveSuccesses = 0; // Reset this, important for adaptive logic
+                testStateRef.current.delay = currentDelay; // Use current delay state.
+                testStateRef.current.consecutiveSuccesses = 0; // Reset this, important for adaptive logic
                 setLastError('');
 
                 runTestIteration();
@@ -163,11 +207,11 @@
                 setAttemptedAdds(0);
                 setSuccessfulAdds(0);
                 setErrorCount(0);
-                // setCurrentDelay(10); // Reset delay to initial? Or keep current? Keep for now.
-                // setLastSuccessfulValue(0); // This would restart numbering from 1. User may not want this if they just reset stats.
-                                            // Let's keep lastSuccessfulValue, so numbering continues.
+                // currentDelay and lastSuccessfulValue are intentionally not reset here.
+                // lastSuccessfulValue reflects DB state or progress within current session.
+                // currentDelay might be something user wants to persist for next run within the session.
                 setLastError('');
-                setLogMessages([]);
+                setLogMessages([]); // Clears current session logs. Initialization log will reappear if page reloaded.
                 testStateRef.current.consecutiveSuccesses = 0;
             }, [addLog]);
 
@@ -175,7 +219,8 @@
                 setVerificationStatus('Verifying...');
                 addLog("Verification started...");
                 try {
-                    await new Promise(resolve => setTimeout(resolve, 500)); 
+                    // Short delay for getList, similar to initialization logic.
+                    await new Promise(resolve => setTimeout(resolve, 300)); 
 
                     const records = room.collection(COLLECTION_NAME).getList();
                     setDbRecordCount(records.length);
@@ -186,7 +231,7 @@
                     setUniqueUsernamesInTest(usernames.size);
 
                     if (records.length > 0) {
-                        const values = records.map(r => r.value).filter(v => typeof v === 'number').sort((a, b) => a - b);
+                        const values = records.map(r => r.value).filter(v => typeof v === 'number' && !isNaN(v)).sort((a, b) => a - b);
                         
                         if (values.length === 0) {
                              setMinDbValue(null);
@@ -206,8 +251,9 @@
                         let missing = 0;
                         const expectedCountInSequence = maxVal - minVal + 1;
                         
-                        if (values.length < expectedCountInSequence) { // Only check if there's a possibility of missing values
-                            const valueSet = new Set(values); // Set of actual unique values found
+                        // Only check for missing if the number of unique values is less than the range span
+                        if (values.length < expectedCountInSequence) { 
+                            const valueSet = new Set(values); 
                             for (let i = minVal; i <= maxVal; i++) {
                                 if (!valueSet.has(i)) {
                                     missing++;
@@ -234,12 +280,13 @@
             }, [addLog]);
 
             React.useEffect(() => {
+                // Cleanup effect to stop test if component unmounts
                 return () => {
                     if (testStateRef.current.running) {
                         handleStopTest(); 
                     }
                 };
-            }, [handleStopTest]);
+            }, [handleStopTest]); // handleStopTest is memoized
 
             return (
                 <div>
@@ -285,4 +332,3 @@
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
-
